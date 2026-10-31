@@ -1,0 +1,703 @@
+import os
+import json
+import uuid
+from datetime import date, datetime
+from cryptography.fernet import Fernet, InvalidToken
+import extra_streamlit_components as stx
+import streamlit as st
+from supabase import create_client
+from supabase.lib.client_options import SyncClientOptions
+
+st.set_page_config(page_title="DOSE REMINDER", page_icon="💊", layout="centered")
+
+AUTH_COOKIE_NAME = "medelder_auth"
+AUTH_COOKIE_MAX_AGE = 400 * 24 * 60 * 60
+
+def tr(en, hi):
+    return hi if st.session_state.get("language", "English") == "Hindi" else en
+
+def get_auth_cookie_cipher():
+    try:
+        key = st.secrets.get(
+            "AUTH_COOKIE_ENCRYPTION_KEY",
+            os.getenv("AUTH_COOKIE_ENCRYPTION_KEY", "")
+        )
+    except Exception:
+        key = os.getenv("AUTH_COOKIE_ENCRYPTION_KEY", "")
+    if not key:
+        st.error(
+            "Persistent login setup is missing. Add AUTH_COOKIE_ENCRYPTION_KEY "
+            "to Streamlit Secrets or the environment."
+        )
+        st.code(
+            "python -c \"from cryptography.fernet import Fernet; "
+            "print(Fernet.generate_key().decode())\""
+        )
+        st.stop()
+    try:
+        return Fernet(key.encode())
+    except (TypeError, ValueError):
+        st.error("AUTH_COOKIE_ENCRYPTION_KEY must be a valid Fernet key.")
+        st.stop()
+
+auth_cookie_cipher = get_auth_cookie_cipher()
+
+@st.fragment
+def get_cookie_manager():
+    return stx.CookieManager(key="medelder-auth-cookie-manager")
+
+cookie_manager = get_cookie_manager()
+
+def save_auth_cookie(access_token, refresh_token, user_id, user_email):
+    encrypted_session = auth_cookie_cipher.encrypt(json.dumps({
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "user_id": user_id,
+        "user_email": user_email
+    }).encode()).decode()
+    cookie_manager.set(
+        AUTH_COOKIE_NAME,
+        encrypted_session,
+        key="save_medelder_auth",
+        max_age=AUTH_COOKIE_MAX_AGE,
+        secure=True,
+        same_site="lax"
+    )
+
+def delete_auth_cookie():
+    if cookie_manager.get(AUTH_COOKIE_NAME):
+        cookie_manager.delete(AUTH_COOKIE_NAME, key="delete_medelder_auth")
+
+def get_client():
+    try:
+        url = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
+        key = st.secrets.get("SUPABASE_ANON_KEY", os.getenv("SUPABASE_ANON_KEY", ""))
+    except Exception:
+        url = os.getenv("SUPABASE_URL", "")
+        key = os.getenv("SUPABASE_ANON_KEY", "")
+    if not url or not key:
+        st.error(
+            "Supabase connection details are missing. In Streamlit Cloud, open "
+            "your app → Settings → Secrets and add SUPABASE_URL and SUPABASE_ANON_KEY."
+        )
+        st.code('SUPABASE_URL = "https://YOUR-PROJECT.supabase.co"\nSUPABASE_ANON_KEY = "YOUR-PUBLISHABLE-KEY"')
+        st.stop()
+    return create_client(
+        url,
+        key,
+        options=SyncClientOptions(auto_refresh_token=False)
+    )
+
+def save_auth(result):
+    session = getattr(result, "session", None)
+    user = getattr(result, "user", None)
+    if session and user:
+        st.session_state["access_token"] = session.access_token
+        st.session_state["refresh_token"] = session.refresh_token
+        st.session_state["user_id"] = user.id
+        st.session_state["user_email"] = user.email or ""
+        save_auth_cookie(
+            session.access_token,
+            session.refresh_token,
+            user.id,
+            user.email or ""
+        )
+        return True
+    return False
+
+sb = get_client()
+
+saved_access_token = st.session_state.get("access_token")
+saved_refresh_token = st.session_state.get("refresh_token")
+if not saved_access_token or not saved_refresh_token:
+    saved_cookie = cookie_manager.get(AUTH_COOKIE_NAME)
+    if saved_cookie:
+        try:
+            saved_session = json.loads(
+                auth_cookie_cipher.decrypt(saved_cookie.encode())
+            )
+            cookie_access_token = saved_session["access_token"]
+            cookie_refresh_token = saved_session["refresh_token"]
+            cookie_user_id = saved_session["user_id"]
+            if not all(
+                isinstance(value, str) and value
+                for value in (
+                    cookie_access_token,
+                    cookie_refresh_token,
+                    cookie_user_id
+                )
+            ):
+                raise ValueError("Saved login cookie has invalid data.")
+            saved_access_token = cookie_access_token
+            saved_refresh_token = cookie_refresh_token
+            st.session_state["user_id"] = saved_session["user_id"]
+            st.session_state["user_email"] = saved_session.get("user_email", "")
+        except (InvalidToken, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            saved_access_token = None
+            saved_refresh_token = None
+            delete_auth_cookie()
+
+if saved_access_token and saved_refresh_token:
+    try:
+        auth_result = sb.auth.set_session(saved_access_token, saved_refresh_token)
+        if not save_auth(auth_result):
+            for key in ("access_token", "refresh_token", "user_id", "user_email"):
+                st.session_state.pop(key, None)
+            st.session_state.pop("_auth_restore_error", None)
+            delete_auth_cookie()
+    except Exception as error:
+        if getattr(error, "status", None) in (400, 401):
+            for key in ("access_token", "refresh_token", "user_id", "user_email"):
+                st.session_state.pop(key, None)
+            st.session_state.pop("_auth_restore_error", None)
+            delete_auth_cookie()
+        else:
+            st.session_state["_auth_restore_error"] = str(error)
+
+st.markdown(
+    """
+    <style>
+        .stApp {
+            background-color: #050914 !important;
+        }
+
+        [data-testid="stAppViewContainer"] {
+            background-color: #050914 !important;
+            background-image: radial-gradient(
+                ellipse 85% 75% at 50% 30%,
+                rgba(37, 99, 235, 0.48) 0%,
+                rgba(30, 64, 175, 0.32) 32%,
+                rgba(15, 23, 42, 0.78) 65%,
+                #050914 100%
+            ) !important;
+            background-attachment: fixed !important;
+            background-repeat: no-repeat !important;
+            background-size: cover !important;
+        }
+
+        [data-testid="stAppViewContainer"] > .main,
+        [data-testid="stMain"] {
+            background: transparent !important;
+        }
+            background-attachment: fixed;
+            background-repeat: no-repeat;
+            background-size: 100% 100%;
+        }
+        .block-container {
+            padding-top: 1.5rem;
+            padding-left: 1rem;
+            padding-right: 1rem;
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 0.25rem;
+            overflow-x: auto;
+        }
+        .stTabs [data-baseweb="tab"] {
+            padding: 0.45rem 0.6rem;
+            font-size: 0.95rem;
+            white-space: nowrap;
+        }
+        [data-testid="stImage"] img {
+            width: 88px;
+            height: 88px;
+            object-fit: cover;
+            border-radius: 12px;
+        }
+        [class*="st-key-taken_"] button,
+        [class*="st-key-skipped_"] button {
+            border-radius: 10px;
+            font-weight: 600;
+        }
+        [class*="st-key-taken_"] button {
+            background-color: #15803d;
+            border-color: #15803d;
+            color: #ffffff;
+        }
+        [class*="st-key-taken_"] button:hover {
+            background-color: #166534;
+            border-color: #166534;
+            color: #ffffff;
+        }
+        [class*="st-key-skipped_"] button {
+            background-color: #dc2626;
+            border-color: #dc2626;
+            color: #ffffff;
+        }
+        [class*="st-key-skipped_"] button:hover {
+            background-color: #b91c1c;
+            border-color: #b91c1c;
+            color: #ffffff;
+        }
+        @media (max-width: 640px) {
+            [class*="st-key-schedule_card_"] [data-testid="stHorizontalBlock"] {
+                flex-wrap: wrap;
+            }
+            [class*="st-key-schedule_card_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child {
+                flex: 0 0 96px !important;
+                min-width: 96px !important;
+            }
+            [class*="st-key-schedule_card_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(2) {
+                flex: 1 1 calc(100% - 104px) !important;
+                min-width: 0 !important;
+            }
+            [class*="st-key-schedule_card_"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:nth-child(3) {
+                flex: 1 1 100% !important;
+                min-width: 0 !important;
+            }
+        }
+        @media (max-width: 640px) {
+            .block-container {
+                padding-top: 1.25rem;
+            }
+        }
+                /* Blend the top Streamlit toolbar into the background */
+        header[data-testid="stHeader"] {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
+
+        [data-testid="stToolbar"] {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+        }
+
+        /* Remove the visible top divider/border */
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        .stApp {
+            border-top: none !important;
+            box-shadow: none !important;
+        }
+
+        /* Give the sidebar expand/collapse arrow a circular shape */
+        [data-testid="stSidebarCollapsedControl"] button,
+        [data-testid="stSidebar"] button[kind="header"] {
+            border-radius: 50% !important;
+            width: 36px !important;
+            height: 36px !important;
+            min-width: 36px !important;
+            background: rgba(30, 41, 59, 0.75) !important;
+            border: 1px solid rgba(148, 163, 184, 0.25) !important;
+            box-shadow: none !important;
+        }
+
+        /* Give the top-right three-dot menu a circular shape */
+        [data-testid="stToolbar"] button,
+        header[data-testid="stHeader"] button {
+            border-radius: 50% !important;
+            width: 36px !important;
+            height: 36px !important;
+            min-width: 36px !important;
+            background: rgba(30, 41, 59, 0.75) !important;
+            border: 1px solid rgba(148, 163, 184, 0.25) !important;
+            box-shadow: none !important;
+        }
+
+        /* Smooth hover effect for both controls */
+        [data-testid="stSidebarCollapsedControl"] button:hover,
+        [data-testid="stSidebar"] button[kind="header"]:hover,
+        [data-testid="stToolbar"] button:hover,
+        header[data-testid="stHeader"] button:hover {
+            background: rgba(59, 130, 246, 0.25) !important;
+            border-color: rgba(96, 165, 250, 0.5) !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    """
+    <h1 style="
+        font-size: 32px;
+        font-weight: 700;
+        text-align: center;
+        line-height: 1.15;
+        margin: 0 0 12px 0;
+    ">
+        💊 DOSE REMINDER
+    </h1>
+    """,
+    unsafe_allow_html=True
+)
+st.caption(tr("Private account-based medicine schedule and dose tracker.",
+              "Private account-based medicine schedule aur dose tracker."))
+
+with st.sidebar:
+    st.session_state["language"] = st.selectbox(
+        "Language / भाषा", ["English", "Hindi"],
+        index=0 if st.session_state.get("language", "English") == "English" else 1
+    )
+
+def auth_screen():
+    st.subheader(tr("Sign in or create an account", "Login karein ya naya account banayein"))
+    tab1, tab2 = st.tabs([tr("Sign in", "Login"), tr("Sign up", "Naya account")])
+    with tab1:
+        with st.form("signin_form"):
+            email = st.text_input(tr("Email", "Email"))
+            password = st.text_input(tr("Password", "Password"), type="password")
+            submitted = st.form_submit_button(tr("Sign in", "Login karein"), use_container_width=True)
+        if submitted:
+            if not email or not password:
+                st.warning(tr("Enter your email and password.", "Email aur password daalein."))
+            else:
+                try:
+                    result = sb.auth.sign_in_with_password({"email": email.strip(), "password": password})
+                    if save_auth(result):
+                        st.rerun()
+                    st.error(tr("Login did not return an active session. Please try again.",
+                                "Login session nahi mila. Dobara try karein."))
+                except Exception as e:
+                    st.error(tr("Sign-in failed. Check your email and password.",
+                                "Login nahi hua. Email aur password check karein."))
+    with tab2:
+        with st.form("signup_form"):
+            new_email = st.text_input(tr("Email address", "Email address"), key="signup_email")
+            new_password = st.text_input(tr("Create password (at least 8 characters)", "Password banayein (kam se kam 8 characters)"), type="password", key="signup_password")
+            confirm = st.text_input(tr("Confirm password", "Password dobara daalein"), type="password")
+            submitted_signup = st.form_submit_button(tr("Create account", "Account banayein"), use_container_width=True)
+        if submitted_signup:
+            if not new_email or not new_password:
+                st.warning(tr("Fill in both fields.", "Dono fields bharein."))
+            elif new_password != confirm:
+                st.warning(tr("Passwords do not match.", "Dono passwords match nahi karte."))
+            elif len(new_password) < 8:
+                st.warning(tr("Use a password with at least 8 characters.", "Kam se kam 8 characters ka password rakhein."))
+            else:
+                try:
+                    result = sb.auth.sign_up({"email": new_email.strip(), "password": new_password})
+                    if save_auth(result):
+                        st.success(tr("Account created.", "Account ban gaya."))
+                        st.rerun()
+                    else:
+                        st.success(tr("Account request created. Check your email for a confirmation link, then return here and sign in.",
+                                      "Account request ban gayi. Email mein confirmation link check karein, phir yahan login karein."))
+                except Exception:
+                    st.error(tr("Could not create the account. The email may already be registered, or the password may not meet the requirements.",
+                                "Account nahi bana. Ho sakta hai email pehle se registered ho ya password requirements poori na hon."))
+
+if not st.session_state.get("user_id"):
+    
+    auth_screen()
+    st.stop()
+
+user_id = st.session_state["user_id"]
+user_email = st.session_state.get("user_email", "")
+if st.session_state.get("_auth_restore_error"):
+    st.warning(
+        "Supabase could not refresh your saved login right now. Your saved "
+        "credentials have been kept; please retry shortly."
+    )
+
+def load_medicines():
+    return sb.table("medicines").select("*").eq("user_id", user_id).eq("active", True).order("scheduled_time").execute().data or []
+
+def load_old_medicines():
+    return sb.table("medicines").select("*").eq("user_id", user_id).eq("active", False).order("scheduled_time").execute().data or []
+
+def load_logs_for_day(day):
+    logs = sb.table("dose_logs").select("*").eq("user_id", user_id).eq("scheduled_date", str(day)).order("scheduled_time").execute().data or []
+    meds = sb.table("medicines").select("id,name,notes,image_path").eq("user_id", user_id).execute().data or []
+    med_map = {m["id"]: m for m in meds}
+    for log in logs:
+        medicine = med_map.get(log["medicine_id"], {})
+        log["medicine_name"] = medicine.get("name", "Medicine")
+        log["medicine_notes"] = medicine.get("notes")
+        log["medicine_image_path"] = medicine.get("image_path")
+    return logs
+
+def ensure_today_logs(medicines):
+    today = date.today()
+    existing = sb.table("dose_logs").select("medicine_id,scheduled_time").eq("user_id", user_id).eq("scheduled_date", str(today)).execute().data or []
+    existing_keys = {(x["medicine_id"], x["scheduled_time"][:8]) for x in existing}
+    for med in medicines:
+        key = (med["id"], med["scheduled_time"][:8])
+        if key not in existing_keys:
+            sb.table("dose_logs").insert({
+                "user_id": user_id,
+                "medicine_id": med["id"],
+                "scheduled_date": str(today),
+                "scheduled_time": med["scheduled_time"],
+                "status": "Unconfirmed"
+            }).execute()
+
+with st.sidebar:
+    st.write(tr("Signed in as", "Login account"), f"**{user_email}**")
+    if st.button(tr("Sign out", "Logout"), use_container_width=True):
+        try:
+            sb.auth.sign_out()
+        except Exception:
+            pass
+        delete_auth_cookie()
+        for key in ("access_token", "refresh_token", "user_id", "user_email"):
+            st.session_state.pop(key, None)
+        st.session_state.pop("_auth_restore_error", None)
+        st.rerun()
+
+try:
+    medicines = load_medicines()
+    old_medicines = load_old_medicines()
+    today = date.today()
+    ensure_today_logs(medicines)
+
+    # Main navigation: use tabs instead of scrolling through every section.
+    today_tab, add_tab, medicines_tab, old_medicines_tab, history_tab = st.tabs([
+        tr("🏠 Today's Schedule", "🏠 Aaj ka Schedule"),
+        tr("➕ Add Medicine", "➕ Dawa Add Karein"),
+        tr("💊 My Medicines", "💊 Meri Dawaein"),
+        tr("🗃️ Old Medicines", "🗃️ Purani Dawaein"),
+        tr("📋 Dose History", "📋 Dose History")
+    ])
+
+    with today_tab:
+        st.subheader(tr("Today's schedule", "Aaj ka schedule"))
+        active_medicine_ids = {medicine["id"] for medicine in medicines}
+        logs = [
+            log for log in load_logs_for_day(today)
+            if log["medicine_id"] in active_medicine_ids
+        ]
+        if not logs:
+            st.info(tr("No active medicines scheduled today. Open the Add Medicine tab to add one.",
+                       "Aaj ke liye koi active medicine schedule nahi hai. Dawa add karne ke liye Add Medicine tab kholein."))
+        image_error = None
+        for log in logs:
+            with st.container(
+                border=True,
+                key=f"schedule_card_{log['id']}"
+            ):
+                image_column, medicine_column, actions_column = st.columns(
+                    [1, 3.5, 1.5]
+                )
+                image_path = log.get("medicine_image_path")
+                if image_path:
+                    try:
+                        image_result = sb.storage.from_("medicine-images").create_signed_url(
+                            image_path, 3600
+                        )
+                        image_url = (
+                            image_result.get("signedURL")
+                            or image_result.get("signedUrl")
+                        )
+                        if image_url:
+                            image_column.image(image_url, width=64)
+                        else:
+                            image_column.markdown("💊")
+                    except Exception as error:
+                        image_error = image_error or error
+                        image_column.markdown("💊")
+                else:
+                    image_column.markdown("💊")
+                medicine_column.markdown(f"**{log['medicine_name']}**")
+                medicine_column.caption(
+                    f"Time: {datetime.strptime(log['scheduled_time'][:8], '%H:%M:%S').strftime('%I:%M %p').lstrip('0')}"
+                )
+                if log.get("medicine_notes"):
+                    medicine_column.write(log["medicine_notes"])
+                medicine_column.caption(
+                    f"{tr('Status', 'Status')}: {log['status']}"
+                )
+                if actions_column.button(
+                    tr("✓ Taken", "✓ Le li"),
+                    key=f"taken_{log['id']}",
+                    use_container_width=True
+                ):
+                    sb.table("dose_logs").update({
+                        "status": "Taken",
+                        "updated_at": datetime.now().astimezone().isoformat()
+                    }).eq("id", log["id"]).eq("user_id", user_id).execute()
+                    st.rerun()
+                if actions_column.button(
+                    tr("✕ Skipped", "✕ Skip"),
+                    key=f"skipped_{log['id']}",
+                    use_container_width=True
+                ):
+                    sb.table("dose_logs").update({
+                        "status": "Skipped",
+                        "updated_at": datetime.now().astimezone().isoformat()
+                    }).eq("id", log["id"]).eq("user_id", user_id).execute()
+                    st.rerun()
+        if image_error:
+            st.warning(tr(
+                "Medicine data loaded, but a photo could not be displayed. Check access to the private medicine-images bucket.",
+                "Medicine data load ho gaya, lekin photo nahi dikh saki. Private medicine-images bucket ka access check karein."
+            ))
+            st.caption(f"Image storage error: {image_error}")
+
+    with add_tab:
+        st.subheader(tr("Add a medicine", "Medicine add karein"))
+        with st.form("add_medicine", clear_on_submit=True):
+            name = st.text_input(tr("Medicine name", "Medicine ka naam"))
+            medicine_image = st.file_uploader(
+                tr("Upload Medicine Image", "Medicine ki photo upload karein"),
+                type=["jpg", "jpeg", "png", "webp"],
+                max_upload_size=5,
+                help=tr(
+                    "Optional. Choose a JPG, JPEG, PNG, or WebP image (maximum 5 MB).",
+                    "Optional. JPG, JPEG, PNG, ya WebP image chunein (maximum 5 MB)."
+                )
+            )
+            time_value = st.time_input(tr("Scheduled time", "Dawa ka time"))
+            notes = st.text_area(
+                tr("Notes (optional)", "Notes (optional)"),
+                placeholder=tr("Example: after food", "Jaise: khane ke baad")
+            )
+            add = st.form_submit_button(tr("Add medicine", "Medicine add karein"),
+                                        use_container_width=True)
+        if add:
+            if not name.strip():
+                st.warning(tr("Please enter a medicine name.", "Medicine ka naam daalein."))
+            elif medicine_image and len(medicine_image.getvalue()) > 5 * 1024 * 1024:
+                st.warning(tr(
+                    "The photo must be 5 MB or smaller.",
+                    "Photo 5 MB ya usse chhoti honi chahiye."
+                ))
+            else:
+                extension = medicine_image.name.rsplit(".", 1)[-1].lower() if medicine_image else None
+                image_types = {
+                    "jpg": ("jpg", "image/jpeg"),
+                    "jpeg": ("jpg", "image/jpeg"),
+                    "png": ("png", "image/png"),
+                    "webp": ("webp", "image/webp")
+                }
+                if medicine_image and extension not in image_types:
+                    st.warning(tr(
+                        "Choose a JPG, JPEG, PNG, or WebP photo.",
+                        "JPG, JPEG, PNG, ya WebP photo chunein."
+                    ))
+                else:
+                    image_path = None
+                    upload_failed = False
+                    if medicine_image:
+                        stored_extension, content_type = image_types[extension]
+                        image_path = f"{user_id}/{uuid.uuid4().hex}.{stored_extension}"
+                        try:
+                            sb.storage.from_("medicine-images").upload(
+                                image_path,
+                                medicine_image.getvalue(),
+                                {"content-type": content_type}
+                            )
+                        except Exception as error:
+                            upload_failed = True
+                            st.error(tr(
+                                "Photo upload failed. Check the medicine-images bucket and your upload permissions.",
+                                "Photo upload nahi hui. medicine-images bucket aur upload permissions check karein."
+                            ))
+                            st.caption(f"Storage upload error: {error}")
+
+                    if not upload_failed:
+                        medicine_data = {
+                            "user_id": user_id,
+                            "name": name.strip(),
+                            "scheduled_time": time_value.strftime("%H:%M:%S"),
+                            "notes": notes.strip(),
+                            "active": True
+                        }
+                        if image_path:
+                            medicine_data["image_path"] = image_path
+                        try:
+                            sb.table("medicines").insert(medicine_data).execute()
+                        except Exception as error:
+                            if image_path:
+                                try:
+                                    sb.storage.from_("medicine-images").remove([image_path])
+                                except Exception as cleanup_error:
+                                    st.warning(tr(
+                                        "The medicine was not saved, and the uploaded photo could not be removed. Contact the app administrator.",
+                                        "Medicine save nahi hui aur upload ki gayi photo remove nahi ho saki. App administrator se sampark karein."
+                                    ))
+                                    st.caption(f"Storage cleanup error: {cleanup_error}")
+                            st.error(tr(
+                                "Could not save the medicine. Check the medicines table and its access policies.",
+                                "Medicine save nahi hui. medicines table aur uski access policies check karein."
+                            ))
+                            st.caption(f"Database insert error: {error}")
+                        else:
+                            st.success(tr("Medicine added.", "Medicine add ho gayi."))
+                            st.rerun()
+
+    with medicines_tab:
+        st.subheader(tr("Your active medicines", "Aapki active medicines"))
+        if medicines:
+            for med in medicines:
+                with st.container(border=True):
+                    st.markdown(f"**{med['name']}** — {med['scheduled_time'][:5]}")
+                    if med.get("notes"):
+                        st.caption(med["notes"])
+                    if st.button(tr("Deactivate", "Band karein"),
+                                 key=f"deactivate_{med['id']}"):
+                        sb.table("medicines").update({"active": False}).eq(
+                            "id", med["id"]
+                        ).eq("user_id", user_id).execute()
+                        st.rerun()
+        else:
+            st.caption(tr("No active medicines.", "Koi active medicine nahi hai."))
+
+    with old_medicines_tab:
+        st.subheader(tr("Old medicines", "Purani dawaein"))
+        if old_medicines:
+            for med in old_medicines:
+                with st.container(border=True):
+                    st.markdown(f"**{med['name']}** — {med['scheduled_time'][:5]}")
+                    if med.get("notes"):
+                        st.caption(med["notes"])
+                    if st.button(tr("Reactivate", "Dobara chalu karein"),
+                                 key=f"reactivate_{med['id']}"):
+                        sb.table("medicines").update({"active": True}).eq(
+                            "id", med["id"]
+                        ).eq("user_id", user_id).execute()
+                        st.rerun()
+        else:
+            st.caption(tr("No old medicines.", "Koi purani dawa nahi hai."))
+
+    with history_tab:
+        st.subheader(tr("Dose history", "Dose history"))
+        history_date = st.date_input(
+            tr("Choose a date", "Date chunein"),
+            value=date.today(),
+            key="history_date"
+        )
+        history_logs = load_logs_for_day(history_date)
+        if history_logs:
+            st.dataframe(
+                [{
+                    "Medicine": x["medicine_name"],
+                    "Time": x["scheduled_time"][:5],
+                    "Status": x["status"]
+                } for x in history_logs],
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.caption(tr("No records for this date.", "Is date ke records nahi hain."))
+
+except Exception as error:
+    st.error(tr(
+        "Could not load data. Check that your Supabase tables and RLS policies were created, and that Streamlit Secrets contain the correct Project URL and publishable key.",
+        "Data load nahi hua. Check karein ki Supabase tables/RLS policies bani hain aur Streamlit Secrets mein sahi Project URL aur publishable key hai."
+    ))
+    st.caption(f"Supabase error: {error}")
+    st.caption(tr("For troubleshooting, open the app logs in Streamlit Cloud. Never paste your secret key into the app or GitHub.",
+                  "Problem solve karne ke liye Streamlit Cloud app logs dekhein. Secret key ko app ya GitHub mein kabhi paste na karein."))
+
+# Footer
+st.markdown(
+    """
+    <div style="
+        text-align: center;
+        color: #9CA3AF;
+        font-size: 12px;
+        margin-top: 40px;
+        padding: 14px 0 8px 0;
+        border-top: 1px solid #374151;
+    ">
+        © 2026 DOSE REMINDER · Developed by ARSHAD
+        <br>
+        <span style="font-size: 10px; color: #6B7280;">
+            All rights reserved.
+        </span>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
